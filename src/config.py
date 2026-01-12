@@ -1,0 +1,3 @@
+MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
+DATASET_ID = "LGAI-EXAONE/MANTA-1M"
+OUTPUT_DIR = "../wanda_visualizations"

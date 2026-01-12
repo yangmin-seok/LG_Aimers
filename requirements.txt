@@ -1,0 +1,18 @@
+# 핵심 딥러닝 프레임워크 (Wanda 구현 필수)
+torch>=2.1.0
+transformers>=4.40.0
+accelerate>=0.29.0
+
+# 데이터 로드 및 전처리 (MANTA-1M 데이터셋 활용)
+datasets>=2.18.0
+sentencepiece>=0.2.0
+tokenizers>=0.19.0
+
+# 분석 및 시각화 (Wanda Metric 히트맵 및 피처 중요도 분석용)
+matplotlib>=3.8.0
+seaborn>=0.13.0
+numpy>=1.26.0
+
+# 환경 설정 및 편의 도구
+python-dotenv>=1.0.0
+tqdm>=4.66.0

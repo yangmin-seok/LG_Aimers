@@ -20,15 +20,14 @@ def load_model_and_tokenizer(model_id, token):
     """
     분석에 필요한 사전 학습된 LLM 모델과 토크나이저를 로드합니다.
     
-    Wanda는 가중치 업데이트가 필요 없는 원샷(One-shot) 방식이므로 
-    모델을 추론 모드(eval)로 사용합니다
+    Wanda는 가중치 업데이트가 필요 없는 원샷(One-shot) 방식이므로 모델을 추론 모드(eval)로 사용합니다
     """
     print(f"🚀 Loading model: {model_id}...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         dtype=torch.bfloat16,
         token=token,
-        device_map="auto"
+        device_map=None
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, token=token)
 

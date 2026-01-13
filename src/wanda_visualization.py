@@ -113,10 +113,7 @@ def calculate_wanda_metric(model, dataloader):
 def visualize_wanda_distribution(layer_idx, layer_data, output_dir):
     """
     Wanda 지표의 레이어별 분포를 시각화하여 파일로 저장합니다.
-    
-    좌측 Heatmap은 가중치의 국소적 강도를 보여주며, 
-    우측 라인 그래프는 전체 입력 차원 중 성능에 결정적인 
-    이상치 피처(Outlier peaks)를 식별하게 해줍니다[cite: 113, 339].
+    좌측 Heatmap은 가중치의 국소적 강도를 보여주며, 우측 라인 그래프는 전체 입력 차원 중 성능에 결정적인 이상치 피처(Outlier peaks)를 식별하게 해줍니다.
     """
     num_modules = len(layer_data)
     fig, axes = plt.subplots(num_modules, 2, figsize=(15, 5 * num_modules))

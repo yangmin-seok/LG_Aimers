@@ -4,8 +4,8 @@ LG Aimers 8기
 ```
 # 가상환경 설정
 ```text
-python -m venv lg_env
-source lg_env/Scripts/activate
+python3.11 -m venv lg_env
+source lg_env/bin/activate
 pip install -r requirements.txt
 ```
 

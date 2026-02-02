@@ -1,18 +1,35 @@
-# 핵심 딥러닝 프레임워크 (Wanda 구현 필수)
-torch>=2.1.0
-transformers>=4.40.0
-accelerate>=0.29.0
+# Core Frameworks
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.0+cu128
+numpy==2.2.6
+pandas==2.3.3
 
-# 데이터 로드 및 전처리 (MANTA-1M 데이터셋 활용)
-datasets>=2.18.0
-sentencepiece>=0.2.0
-tokenizers>=0.19.0
+# NLP & Model Tools
+transformers==4.57.3
+tokenizers==0.22.1
+accelerate==1.10.1
+datasets==4.4.1
+huggingface-hub==0.36.0
+safetensors==0.7.0
+sentencepiece==0.2.1
+protobuf==6.33.2
 
-# 분석 및 시각화 (Wanda Metric 히트맵 및 피처 중요도 분석용)
-matplotlib>=3.8.0
-seaborn>=0.13.0
-numpy>=1.26.0
+# Evaluation & Metrics
+evaluate==0.4.6
+rouge_score==0.1.2
+sacrebleu==2.5.1
 
-# 환경 설정 및 편의 도구
-python-dotenv>=1.0.0
-tqdm>=4.66.0
+# Utilities & Specialized
+tqdm==4.67.1
+regex==2025.11.3
+nltk==3.9.2
+compressed-tensors==0.13.0
+math-verify==0.8.0
+antlr4-python3-runtime==4.11.0
+sympy==1.14.0
+langdetect==1.0.9
+immutabledict==4.2.2
+torch-c-dlpack-ext==0.1.4
+
+# Inference Engine
+vllm==0.14.1

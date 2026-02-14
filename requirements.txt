@@ -23,6 +23,7 @@ sacrebleu==2.5.1
 tqdm==4.67.1
 regex==2025.11.3
 nltk==3.9.2
+llmcompressor
 compressed-tensors==0.13.0
 math-verify==0.8.0
 antlr4-python3-runtime==4.11.0

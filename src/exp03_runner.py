@@ -2,7 +2,9 @@ import argparse
 import csv
 import gc
 import json
+import re
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -247,9 +249,10 @@ def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int
 
 
 def compute_score(perf_model: float, perf_base: float, spt_model: float, spt_base: float):
-    # Competition formula expects a task performance metric (Perf_model / Perf_base_model).
-    # Here we use CE-loss-derived proxy, so we invert it to keep "higher is better".
-    perf_norm = perf_base / max(perf_model, 1e-12)
+    # Official competition formula:
+    # PerfNorm = Perf_model / Perf_base_model
+    # SpeedNorm = 1 - (sec_per_tok_model / sec_per_tok_base)
+    perf_norm = perf_model / max(perf_base, 1e-12)
     speed_norm = 1.0 - (spt_model / max(spt_base, 1e-12))
     score = max(0.5 * perf_norm + 0.5 * speed_norm, 0.0)
     return perf_norm, speed_norm, score
@@ -272,7 +275,7 @@ def free_memory(*objs):
         torch.cuda.empty_cache()
 
 
-def run_experiment(exp: Experiment, tokenizer, eval_ds, base_perf, base_spt, dtype):
+def run_experiment(exp: Experiment, tokenizer, eval_ds, dtype):
     print(f"[RUN] {exp.name}")
     model = load_model(dtype=dtype, device_map="auto")
     targets = build_targets(exp.layer_start, exp.layer_end, exp.submodules)
@@ -296,18 +299,14 @@ def run_experiment(exp: Experiment, tokenizer, eval_ds, base_perf, base_spt, dty
         max_seq_length=exp.max_seq_len,
         num_calibration_samples=exp.n_calib,
     )
-    perf = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
+    ce_loss = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
     spt = sec_per_token(model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
-    perf_norm, speed_norm, score = compute_score(perf, base_perf, spt, base_spt)
     return model, {
         "name": exp.name,
         "model_source": "fresh_quantized",
         "signature": exp.signature(),
-        "perf_proxy_ce": perf,
+        "ce_loss": ce_loss,
         "speed_proxy_sec_per_token": spt,
-        "PerfNorm": perf_norm,
-        "SpeedNorm": speed_norm,
-        "ScoreProxy": score,
     }
 
 
@@ -322,12 +321,56 @@ def save_results_csv(rows, out_csv: Path):
         writer.writerows(rows)
 
 
+def ensure_clean_dir(path: Path):
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def parse_perf_from_output(text: str) -> float:
+    # Accept either plain float output or lines containing a float.
+    for line in reversed(text.splitlines()):
+        m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", line)
+        if m:
+            return float(m.group(0))
+    raise RuntimeError("Could not parse perf value from external evaluator output.")
+
+
+def evaluate_perf_external(perf_cmd_template: str, model_dir: Path) -> float:
+    cmd = perf_cmd_template.format(model_dir=model_dir.as_posix())
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Perf evaluation command failed (code={result.returncode}).\n"
+            f"cmd: {cmd}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return parse_perf_from_output(f"{result.stdout}\n{result.stderr}")
+
+
+def resolve_perf(
+    perf_source: str,
+    perf_cmd_template: str,
+    model_dir: Path,
+    ce_loss: float,
+) -> tuple[float, str]:
+    if perf_source == "external":
+        if not perf_cmd_template:
+            raise ValueError("--perf-cmd-template is required when --perf-source=external")
+        perf = evaluate_perf_external(perf_cmd_template=perf_cmd_template, model_dir=model_dir)
+        return perf, "external"
+    # Fallback debug mode only.
+    return 1.0 / max(ce_loss, 1e-12), "ce_proxy"
+
+
 def print_score_breakdown(row):
     msg = (
         f"[SCORE] {row['name']} | "
+        f"Perf={row['Perf']:.6f} | "
         f"PerfNorm={row['PerfNorm']:.6f} | "
+        f"sec/token={row['speed_proxy_sec_per_token']:.6f} | "
         f"SpeedNorm={row['SpeedNorm']:.6f} | "
-        f"ScoreProxy={row['ScoreProxy']:.6f}"
+        f"Score={row['Score']:.6f} | "
+        f"CE_loss={row['ce_loss']:.6f}"
     )
     if "ScorePred_AnchoredToExp03" in row:
         msg += f" | ScorePred={row['ScorePred_AnchoredToExp03']:.6f}"
@@ -343,10 +386,10 @@ def apply_exp03_anchor(rows, exp03_public_score: float):
     if anchor_row is None:
         return None
 
-    anchor_proxy = float(anchor_row["ScoreProxy"])
+    anchor_proxy = float(anchor_row["Score"])
     # Additive calibration: keeps relative gaps and guarantees Exp_03 => target score.
     for row in rows:
-        calibrated = exp03_public_score + (float(row["ScoreProxy"]) - anchor_proxy)
+        calibrated = exp03_public_score + (float(row["Score"]) - anchor_proxy)
         row["ScorePred_AnchoredToExp03"] = max(calibrated, 0.0)
     anchor_row["ScorePred_AnchoredToExp03"] = exp03_public_score
     return {
@@ -367,6 +410,14 @@ def main():
     parser.add_argument("--skip-exp03-anchor", action="store_true")
     parser.add_argument("--exp03-public-score", default=0.605, type=float)
     parser.add_argument("--exp03-model-dir", default="artifacts/exp03_anchor_model", type=str)
+    parser.add_argument("--perf-source", default="external", choices=["external", "ce_proxy"])
+    parser.add_argument(
+        "--perf-cmd-template",
+        default="",
+        type=str,
+        help="External perf evaluator command template. Use {model_dir} placeholder.",
+    )
+    parser.add_argument("--base-model-dir", default="", type=str)
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
@@ -376,13 +427,34 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     eval_ds = make_text_dataset(tokenizer, f"train[20000:{20000 + args.eval_samples}]")
 
-    # Baseline metric: unquantized base model.
+    # Baseline model: speed and diagnostic CE-loss.
     base_model = load_model(dtype=dtype, device_map="auto")
-    base_perf = mean_ce_loss(base_model, tokenizer, eval_ds, max_len=512)
+    base_ce = mean_ce_loss(base_model, tokenizer, eval_ds, max_len=512)
     base_spt = sec_per_token(base_model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
+
+    perf_tmp_root = output_dir / "perf_models"
+    perf_tmp_root.mkdir(parents=True, exist_ok=True)
+    if args.base_model_dir:
+        base_model_dir = Path(args.base_model_dir)
+        if not base_model_dir.exists():
+            raise FileNotFoundError(f"--base-model-dir does not exist: {base_model_dir}")
+    else:
+        base_model_dir = perf_tmp_root / "base_model"
+        ensure_clean_dir(base_model_dir)
+        base_model.save_pretrained(base_model_dir, safe_serialization=True)
+        tokenizer.save_pretrained(base_model_dir)
+    base_perf, base_perf_source = resolve_perf(
+        perf_source=args.perf_source,
+        perf_cmd_template=args.perf_cmd_template,
+        model_dir=base_model_dir,
+        ce_loss=base_ce,
+    )
     free_memory(base_model)
 
-    print(f"[BASE] perf_proxy_ce={base_perf:.6f} speed_proxy_sec_per_token={base_spt:.6f}")
+    print(
+        f"[BASE] Perf={base_perf:.6f} (source={base_perf_source}) | "
+        f"sec/token={base_spt:.6f} | CE_loss={base_ce:.6f}"
+    )
 
     candidates = [
         Experiment(
@@ -458,31 +530,53 @@ def main():
                 torch_dtype=dtype,
                 device_map="auto",
             )
-            perf = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
+            ce_loss = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
             spt = sec_per_token(model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
+            perf, perf_source = resolve_perf(
+                perf_source=args.perf_source,
+                perf_cmd_template=args.perf_cmd_template,
+                model_dir=exp03_model_dir,
+                ce_loss=ce_loss,
+            )
             perf_norm, speed_norm, score = compute_score(perf, base_perf, spt, base_spt)
             row = {
                 "name": exp.name,
                 "model_source": f"loaded_from:{exp03_model_dir.as_posix()}",
                 "signature": exp.signature(),
-                "perf_proxy_ce": perf,
+                "perf_source": perf_source,
+                "Perf": perf,
+                "ce_loss": ce_loss,
                 "speed_proxy_sec_per_token": spt,
                 "PerfNorm": perf_norm,
                 "SpeedNorm": speed_norm,
-                "ScoreProxy": score,
+                "Score": score,
             }
         else:
             model, row = run_experiment(
                 exp=exp,
                 tokenizer=tokenizer,
                 eval_ds=eval_ds,
-                base_perf=base_perf,
-                base_spt=base_spt,
                 dtype=dtype,
             )
+            exp_model_dir = perf_tmp_root / exp.name
+            ensure_clean_dir(exp_model_dir)
+            model.save_pretrained(exp_model_dir, safe_serialization=True, save_compressed=True)
+            tokenizer.save_pretrained(exp_model_dir)
+            perf, perf_source = resolve_perf(
+                perf_source=args.perf_source,
+                perf_cmd_template=args.perf_cmd_template,
+                model_dir=exp_model_dir,
+                ce_loss=row["ce_loss"],
+            )
+            perf_norm, speed_norm, score = compute_score(perf, base_perf, row["speed_proxy_sec_per_token"], base_spt)
+            row["perf_source"] = perf_source
+            row["Perf"] = perf
+            row["PerfNorm"] = perf_norm
+            row["SpeedNorm"] = speed_norm
+            row["Score"] = score
         rows.append(row)
         print_score_breakdown(row)
-        if best_row is None or row["ScoreProxy"] > best_row["ScoreProxy"]:
+        if best_row is None or row["Score"] > best_row["Score"]:
             if best_model is not None:
                 free_memory(best_model)
             best_model = model
@@ -531,8 +625,8 @@ def main():
         "best": best_row,
         "historical_baseline": {"name": "Exp_03", "public_score": 0.605, "elapsed": "9m36s"},
         "historical_results": HISTORICAL_RESULTS,
-        "perf_metric_note": "PerfNorm here uses CE-loss proxy (not official hidden benchmark Perf).",
-        "base": {"perf_proxy_ce": base_perf, "speed_proxy_sec_per_token": base_spt},
+        "perf_metric_note": "Score uses official formula shape with Perf from external evaluator if provided.",
+        "base": {"Perf": base_perf, "perf_source": base_perf_source, "ce_loss": base_ce, "speed_sec_per_token": base_spt},
         "calibration": calibration,
         "saved_model_dir": str(final_model_dir),
         "submission_zip": f"{zip_no_ext}.zip",

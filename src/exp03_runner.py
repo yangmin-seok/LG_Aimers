@@ -402,7 +402,7 @@ def apply_exp03_anchor(rows, exp03_public_score: float):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out-dir", default="artifacts/exp03_runner", type=str)
+    parser.add_argument("--out-dir", default="content/drive/MyDrive/model", type=str)
     parser.add_argument("--final-model-dir", default="artifacts/final_model", type=str)
     parser.add_argument("--submission-zip", default="submit.zip", type=str)
     parser.add_argument("--eval-samples", default=96, type=int)

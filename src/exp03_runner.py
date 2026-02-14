@@ -186,19 +186,26 @@ def to_chat_text(tokenizer, conversations):
 
 
 def make_text_dataset(tokenizer, split_expr: str) -> Dataset:
+    print(f"[DATASET] loading split: {split_expr}")
     ds = load_dataset(DATASET_ID, split=split_expr)
-    return ds.map(
+    text_ds = ds.map(
         lambda x: {"text": to_chat_text(tokenizer, x["conversations"])},
         remove_columns=ds.column_names,
     )
+    print(f"[DATASET] prepared text dataset: {len(text_ds)} rows")
+    return text_ds
 
 
 def mean_ce_loss(model, tokenizer, ds, max_len: int) -> float:
     model.eval()
     total_nll = 0.0
     total_tokens = 0
+    total_rows = len(ds) if hasattr(ds, "__len__") else None
+    progress_step = max(total_rows // 10, 1) if total_rows else None
+    if total_rows:
+        print(f"[EVAL-CE] start: {total_rows} samples")
     with torch.no_grad():
-        for row in ds:
+        for i, row in enumerate(ds, start=1):
             enc = tokenizer(
                 row["text"],
                 return_tensors="pt",
@@ -212,15 +219,24 @@ def mean_ce_loss(model, tokenizer, ds, max_len: int) -> float:
             n_tokens = int(enc["input_ids"].shape[1])
             total_nll += float(out.loss.item()) * n_tokens
             total_tokens += n_tokens
-    return total_nll / max(total_tokens, 1)
+            if total_rows and (i % progress_step == 0 or i == total_rows):
+                pct = (i / total_rows) * 100.0
+                print(f"[EVAL-CE] progress: {i}/{total_rows} ({pct:.0f}%)")
+    ce = total_nll / max(total_tokens, 1)
+    print(f"[EVAL-CE] done: tokens={total_tokens}, loss={ce:.6f}")
+    return ce
 
 
 def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int = 64) -> float:
     model.eval()
     total_time = 0.0
     total_new_tokens = 0
+    total_rows = len(ds) if hasattr(ds, "__len__") else None
+    progress_step = max(total_rows // 10, 1) if total_rows else None
+    if total_rows:
+        print(f"[EVAL-SPD] start: {total_rows} samples, max_new_tokens={max_new_tokens}")
     with torch.no_grad():
-        for row in ds:
+        for i, row in enumerate(ds, start=1):
             enc = tokenizer(
                 row["text"],
                 return_tensors="pt",
@@ -245,7 +261,12 @@ def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int
             if new_tokens > 0:
                 total_time += elapsed
                 total_new_tokens += new_tokens
-    return total_time / max(total_new_tokens, 1)
+            if total_rows and (i % progress_step == 0 or i == total_rows):
+                pct = (i / total_rows) * 100.0
+                print(f"[EVAL-SPD] progress: {i}/{total_rows} ({pct:.0f}%)")
+    spt = total_time / max(total_new_tokens, 1)
+    print(f"[EVAL-SPD] done: new_tokens={total_new_tokens}, sec/token={spt:.6f}")
+    return spt
 
 
 def compute_score(perf_model: float, perf_base: float, spt_model: float, spt_base: float):
@@ -277,8 +298,11 @@ def free_memory(*objs):
 
 def run_experiment(exp: Experiment, tokenizer, eval_ds, dtype):
     print(f"[RUN] {exp.name}")
+    print(f"[RUN] loading model: {MODEL_ID}")
     model = load_model(dtype=dtype, device_map="auto")
     targets = build_targets(exp.layer_start, exp.layer_end, exp.submodules)
+    print(f"[RUN] target modules: {len(targets)}")
+    print(f"[RUN] preparing calibration dataset: n_calib={exp.n_calib}, max_seq_len={exp.max_seq_len}")
     calib_ds = make_text_dataset(tokenizer, f"train[:{exp.n_calib}]")
     modifier_kwargs = {
         "scheme": exp.scheme,
@@ -292,6 +316,7 @@ def run_experiment(exp: Experiment, tokenizer, eval_ds, dtype):
     if exp.sequential_targets:
         modifier_kwargs["sequential_targets"] = list(exp.sequential_targets)
     recipe = [GPTQModifier(**modifier_kwargs)]
+    print("[RUN] quantization started")
     oneshot(
         model=model,
         dataset=calib_ds,
@@ -299,8 +324,12 @@ def run_experiment(exp: Experiment, tokenizer, eval_ds, dtype):
         max_seq_length=exp.max_seq_len,
         num_calibration_samples=exp.n_calib,
     )
+    print("[RUN] quantization finished")
+    print("[RUN] evaluating CE loss")
     ce_loss = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
+    print("[RUN] evaluating speed proxy")
     spt = sec_per_token(model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
+    print(f"[RUN] {exp.name} done")
     return model, {
         "name": exp.name,
         "model_source": "fresh_quantized",
@@ -338,13 +367,16 @@ def parse_perf_from_output(text: str) -> float:
 
 def evaluate_perf_external(perf_cmd_template: str, model_dir: Path) -> float:
     cmd = perf_cmd_template.format(model_dir=model_dir.as_posix())
+    print(f"[PERF] evaluating external metric for: {model_dir}")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
             f"Perf evaluation command failed (code={result.returncode}).\n"
             f"cmd: {cmd}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-    return parse_perf_from_output(f"{result.stdout}\n{result.stderr}")
+    perf = parse_perf_from_output(f"{result.stdout}\n{result.stderr}")
+    print(f"[PERF] done: {perf:.6f}")
+    return perf
 
 
 def resolve_perf(
@@ -424,12 +456,17 @@ def main():
     output_dir = Path(args.out_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    print("[INIT] loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    print(f"[INIT] preparing eval dataset: {args.eval_samples} samples")
     eval_ds = make_text_dataset(tokenizer, f"train[20000:{20000 + args.eval_samples}]")
 
     # Baseline model: speed and diagnostic CE-loss.
+    print("[BASE] loading baseline model")
     base_model = load_model(dtype=dtype, device_map="auto")
+    print("[BASE] computing CE loss")
     base_ce = mean_ce_loss(base_model, tokenizer, eval_ds, max_len=512)
+    print("[BASE] computing speed proxy")
     base_spt = sec_per_token(base_model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
 
     perf_tmp_root = output_dir / "perf_models"
@@ -516,7 +553,9 @@ def main():
     best_model = None
     best_row = None
 
-    for exp in candidates:
+    total_candidates = len(candidates)
+    for idx, exp in enumerate(candidates, start=1):
+        print(f"[LOOP] candidate {idx}/{total_candidates}: {exp.name}")
         # exp03_anchor is intentionally rerun as calibration anchor.
         if exp.name != "exp03_anchor" and exp.signature() in known_signatures:
             print(f"[SKIP] duplicate signature: {exp.name}")

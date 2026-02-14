@@ -247,7 +247,8 @@ def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int
 
 
 def compute_score(perf_model: float, perf_base: float, spt_model: float, spt_base: float):
-    # Lower CE loss is better, so invert ratio for a high-is-better PerfNorm proxy.
+    # Competition formula expects a task performance metric (Perf_model / Perf_base_model).
+    # Here we use CE-loss-derived proxy, so we invert it to keep "higher is better".
     perf_norm = perf_base / max(perf_model, 1e-12)
     speed_norm = 1.0 - (spt_model / max(spt_base, 1e-12))
     score = max(0.5 * perf_norm + 0.5 * speed_norm, 0.0)
@@ -300,6 +301,7 @@ def run_experiment(exp: Experiment, tokenizer, eval_ds, base_perf, base_spt, dty
     perf_norm, speed_norm, score = compute_score(perf, base_perf, spt, base_spt)
     return model, {
         "name": exp.name,
+        "model_source": "fresh_quantized",
         "signature": exp.signature(),
         "perf_proxy_ce": perf,
         "speed_proxy_sec_per_token": spt,
@@ -318,6 +320,18 @@ def save_results_csv(rows, out_csv: Path):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def print_score_breakdown(row):
+    msg = (
+        f"[SCORE] {row['name']} | "
+        f"PerfNorm={row['PerfNorm']:.6f} | "
+        f"SpeedNorm={row['SpeedNorm']:.6f} | "
+        f"ScoreProxy={row['ScoreProxy']:.6f}"
+    )
+    if "ScorePred_AnchoredToExp03" in row:
+        msg += f" | ScorePred={row['ScorePred_AnchoredToExp03']:.6f}"
+    print(msg)
 
 
 def apply_exp03_anchor(rows, exp03_public_score: float):
@@ -352,6 +366,7 @@ def main():
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--skip-exp03-anchor", action="store_true")
     parser.add_argument("--exp03-public-score", default=0.605, type=float)
+    parser.add_argument("--exp03-model-dir", default="artifacts/exp03_anchor_model", type=str)
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
@@ -434,16 +449,39 @@ def main():
         if exp.name != "exp03_anchor" and exp.signature() in known_signatures:
             print(f"[SKIP] duplicate signature: {exp.name}")
             continue
-        model, row = run_experiment(
-            exp=exp,
-            tokenizer=tokenizer,
-            eval_ds=eval_ds,
-            base_perf=base_perf,
-            base_spt=base_spt,
-            dtype=dtype,
-        )
+        exp03_model_dir = Path(args.exp03_model_dir)
+        if exp.name == "exp03_anchor" and exp03_model_dir.exists():
+            print(f"[RUN] {exp.name} (load prebuilt model: {exp03_model_dir})")
+            model = AutoModelForCausalLM.from_pretrained(
+                exp03_model_dir.as_posix(),
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                device_map="auto",
+            )
+            perf = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
+            spt = sec_per_token(model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
+            perf_norm, speed_norm, score = compute_score(perf, base_perf, spt, base_spt)
+            row = {
+                "name": exp.name,
+                "model_source": f"loaded_from:{exp03_model_dir.as_posix()}",
+                "signature": exp.signature(),
+                "perf_proxy_ce": perf,
+                "speed_proxy_sec_per_token": spt,
+                "PerfNorm": perf_norm,
+                "SpeedNorm": speed_norm,
+                "ScoreProxy": score,
+            }
+        else:
+            model, row = run_experiment(
+                exp=exp,
+                tokenizer=tokenizer,
+                eval_ds=eval_ds,
+                base_perf=base_perf,
+                base_spt=base_spt,
+                dtype=dtype,
+            )
         rows.append(row)
-        print(f"[RESULT] {row}")
+        print_score_breakdown(row)
         if best_row is None or row["ScoreProxy"] > best_row["ScoreProxy"]:
             if best_model is not None:
                 free_memory(best_model)
@@ -461,6 +499,8 @@ def main():
     calibration = apply_exp03_anchor(rows, args.exp03_public_score)
     if calibration is not None:
         print(f"[CALIBRATION] {calibration}")
+        for row in rows:
+            print_score_breakdown(row)
         save_results_csv(rows, output_dir / "results.csv")
         (output_dir / "results.json").write_text(
             json.dumps(rows, ensure_ascii=False, indent=2),
@@ -491,6 +531,7 @@ def main():
         "best": best_row,
         "historical_baseline": {"name": "Exp_03", "public_score": 0.605, "elapsed": "9m36s"},
         "historical_results": HISTORICAL_RESULTS,
+        "perf_metric_note": "PerfNorm here uses CE-loss proxy (not official hidden benchmark Perf).",
         "base": {"perf_proxy_ce": base_perf, "speed_proxy_sec_per_token": base_spt},
         "calibration": calibration,
         "saved_model_dir": str(final_model_dir),

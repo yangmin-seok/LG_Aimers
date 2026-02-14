@@ -8,6 +8,7 @@ This repository now includes `src/exp03_runner.py` to:
    - `SpeedNorm` (proxy from decode sec/token ratio vs base model)
    - `ScoreProxy = max(0.5*PerfNorm + 0.5*SpeedNorm, 0)`
 3. Always rerun `Exp_03` once as `exp03_anchor` (unless explicitly skipped)
+   - If `--exp03-model-dir` exists, it loads that model and skips re-quantization.
 4. Calibrate predicted score to known `Exp_03=0.605`:
    - `ScorePred_AnchoredToExp03 = 0.605 + (ScoreProxy - ScoreProxy_exp03_anchor)`
 5. Avoid re-running known duplicate experiments (except the `exp03_anchor` run)
@@ -25,6 +26,12 @@ Optional:
 python -m src.exp03_runner --skip-exp03-anchor
 ```
 
+Use local prebuilt Exp_03 model:
+
+```bash
+python -m src.exp03_runner --exp03-model-dir ./model_QPTQ_layer5_24
+```
+
 ## Outputs
 
 - `artifacts/exp03_runner/results.csv`
@@ -38,3 +45,4 @@ python -m src.exp03_runner --skip-exp03-anchor
 - No Colab-only code is used (`!pip`, `google.colab`, `files.download` are not used).
 - This runner is designed for CUDA GPU environments compatible with EXAONE + GPTQ.
 - Public leaderboard score and this local `ScoreProxy` are not numerically identical.
+- `PerfNorm` in this runner is CE-loss-based proxy (`base_ce / model_ce`), not hidden benchmark official `Perf_model`.

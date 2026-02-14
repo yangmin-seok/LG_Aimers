@@ -320,6 +320,29 @@ def save_results_csv(rows, out_csv: Path):
         writer.writerows(rows)
 
 
+def apply_exp03_anchor(rows, exp03_public_score: float):
+    anchor_row = None
+    for row in rows:
+        if row["name"] == "exp03_anchor":
+            anchor_row = row
+            break
+    if anchor_row is None:
+        return None
+
+    anchor_proxy = float(anchor_row["ScoreProxy"])
+    # Additive calibration: keeps relative gaps and guarantees Exp_03 => target score.
+    for row in rows:
+        calibrated = exp03_public_score + (float(row["ScoreProxy"]) - anchor_proxy)
+        row["ScorePred_AnchoredToExp03"] = max(calibrated, 0.0)
+    anchor_row["ScorePred_AnchoredToExp03"] = exp03_public_score
+    return {
+        "anchor_name": "exp03_anchor",
+        "anchor_proxy_score": anchor_proxy,
+        "anchor_public_score": exp03_public_score,
+        "method": "additive_shift",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="artifacts/exp03_runner", type=str)
@@ -327,7 +350,8 @@ def main():
     parser.add_argument("--submission-zip", default="submit.zip", type=str)
     parser.add_argument("--eval-samples", default=96, type=int)
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
-    parser.add_argument("--include-exp03-baseline", action="store_true")
+    parser.add_argument("--skip-exp03-anchor", action="store_true")
+    parser.add_argument("--exp03-public-score", default=0.605, type=float)
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
@@ -346,7 +370,11 @@ def main():
     print(f"[BASE] perf_proxy_ce={base_perf:.6f} speed_proxy_sec_per_token={base_spt:.6f}")
 
     candidates = [
-        # Exp_03 baseline is skipped to avoid duplication and wasted budget.
+        Experiment(
+            name="exp03_anchor",
+            layer_start=5,
+            layer_end=24,
+        ),
         Experiment(
             name="new_01_layer5_24_actorder_group",
             layer_start=5,
@@ -393,15 +421,8 @@ def main():
         ),
     ]
 
-    if args.include_exp03_baseline:
-        candidates.insert(
-            0,
-            Experiment(
-                name="exp03_baseline_rerun",
-                layer_start=5,
-                layer_end=24,
-            ),
-        )
+    if args.skip_exp03_anchor:
+        candidates = [c for c in candidates if c.name != "exp03_anchor"]
 
     known_signatures = set(KNOWN_EXPERIMENTS.values())
     rows = []
@@ -409,7 +430,8 @@ def main():
     best_row = None
 
     for exp in candidates:
-        if exp.signature() in known_signatures:
+        # exp03_anchor is intentionally rerun as calibration anchor.
+        if exp.name != "exp03_anchor" and exp.signature() in known_signatures:
             print(f"[SKIP] duplicate signature: {exp.name}")
             continue
         model, row = run_experiment(
@@ -430,6 +452,15 @@ def main():
         else:
             free_memory(model)
 
+        save_results_csv(rows, output_dir / "results.csv")
+        (output_dir / "results.json").write_text(
+            json.dumps(rows, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    calibration = apply_exp03_anchor(rows, args.exp03_public_score)
+    if calibration is not None:
+        print(f"[CALIBRATION] {calibration}")
         save_results_csv(rows, output_dir / "results.csv")
         (output_dir / "results.json").write_text(
             json.dumps(rows, ensure_ascii=False, indent=2),
@@ -461,6 +492,7 @@ def main():
         "historical_baseline": {"name": "Exp_03", "public_score": 0.605, "elapsed": "9m36s"},
         "historical_results": HISTORICAL_RESULTS,
         "base": {"perf_proxy_ce": base_perf, "speed_proxy_sec_per_token": base_spt},
+        "calibration": calibration,
         "saved_model_dir": str(final_model_dir),
         "submission_zip": f"{zip_no_ext}.zip",
     }

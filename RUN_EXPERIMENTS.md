@@ -7,8 +7,11 @@ This repository now includes `src/exp03_runner.py` to:
    - `PerfNorm` (proxy from CE loss ratio vs base model)
    - `SpeedNorm` (proxy from decode sec/token ratio vs base model)
    - `ScoreProxy = max(0.5*PerfNorm + 0.5*SpeedNorm, 0)`
-3. Avoid re-running known duplicate experiments (Exp_03 family from history)
-4. Save only the best model once, then create `submit.zip` in required format
+3. Always rerun `Exp_03` once as `exp03_anchor` (unless explicitly skipped)
+4. Calibrate predicted score to known `Exp_03=0.605`:
+   - `ScorePred_AnchoredToExp03 = 0.605 + (ScoreProxy - ScoreProxy_exp03_anchor)`
+5. Avoid re-running known duplicate experiments (except the `exp03_anchor` run)
+6. Save only the best model once, then create `submit.zip` in required format
 
 ## Run
 
@@ -19,7 +22,7 @@ python -m src.exp03_runner --out-dir artifacts/exp03_runner --final-model-dir ar
 Optional:
 
 ```bash
-python -m src.exp03_runner --include-exp03-baseline
+python -m src.exp03_runner --skip-exp03-anchor
 ```
 
 ## Outputs

@@ -143,6 +143,29 @@ KNOWN_EXPERIMENTS = {
     ),
 }
 
+HISTORICAL_RESULTS = [
+    {"name": "Exp_03", "score": 0.605, "time": "9m36s"},
+    {"name": "Exp_27", "score": 0.603, "time": "10m28s"},
+    {"name": "Exp_30", "score": 0.596, "time": "9m54s"},
+    {"name": "Exp_23", "score": 0.592, "time": "10m56s"},
+    {"name": "Exp_22", "score": 0.587, "time": "10m24s"},
+    {"name": "Exp_06", "score": 0.578, "time": "10m27s"},
+    {"name": "Exp_02", "score": 0.575, "time": "11m02s"},
+    {"name": "Exp_04", "score": 0.538, "time": "12m19s"},
+    {"name": "Exp_21", "score": 0.504, "time": "13m35s"},
+    {"name": "Exp_09", "score": 0.503, "time": "12m57s"},
+    {"name": "Exp_11", "score": 0.501, "time": "13m03s"},
+    {"name": "Exp_07", "score": 0.500, "time": "12m58s"},
+    {"name": "Exp_17", "score": 0.498, "time": "12m25s"},
+    {"name": "Exp_13", "score": 0.486, "time": "12m56s"},
+    {"name": "Exp_01", "score": 0.476, "time": "13m31s"},
+    {"name": "Exp_19", "score": 0.474, "time": "14m06s"},
+    {"name": "Exp_20", "score": 0.471, "time": "13m05s"},
+    {"name": "Exp_10", "score": 0.448, "time": "14m08s"},
+    {"name": "Exp_05", "score": 0.136, "time": "12m44s"},
+    {"name": "Exp_32", "score": None, "time": "20m (timeout)"},
+]
+
 
 def build_targets(layer_start: int, layer_end: int, submodules: Iterable[str]) -> List[str]:
     targets = []
@@ -436,6 +459,7 @@ def main():
     summary = {
         "best": best_row,
         "historical_baseline": {"name": "Exp_03", "public_score": 0.605, "elapsed": "9m36s"},
+        "historical_results": HISTORICAL_RESULTS,
         "base": {"perf_proxy_ce": base_perf, "speed_proxy_sec_per_token": base_spt},
         "saved_model_dir": str(final_model_dir),
         "submission_zip": f"{zip_no_ext}.zip",

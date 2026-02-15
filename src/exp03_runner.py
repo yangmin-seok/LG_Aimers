@@ -57,7 +57,7 @@ EVAL_BATCH_SIZE = 8
 SPEED_BATCH_SIZE = 4
 PREFER_CUDA = True
 REQUIRE_CUDA = True
-QUANTIZED_MODEL_DIR = "quantized_models"
+QUANTIZED_MODEL_SUBDIR = "quantized_models"
 
 
 @dataclass(frozen=True)
@@ -656,7 +656,7 @@ def main():
 
     perf_tmp_root = output_dir / "perf_models"
     perf_tmp_root.mkdir(parents=True, exist_ok=True)
-    quantized_root = Path(QUANTIZED_MODEL_DIR)
+    quantized_root = output_dir / QUANTIZED_MODEL_SUBDIR
     quantized_root.mkdir(parents=True, exist_ok=True)
 
     use_precomputed_base = all(v is not None for v in (BASE_CE_LOSS, BASE_SPEED_SEC_PER_TOKEN, BASE_PERF))

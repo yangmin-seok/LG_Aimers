@@ -224,14 +224,16 @@ def make_text_dataset(tokenizer, split_expr: str) -> Dataset:
 
 
 def get_eval_device(model) -> torch.device:
+    preferred = get_preferred_device()
+    if preferred.type == "cuda":
+        return preferred
     try:
         return next(model.parameters()).device
     except StopIteration:
         try:
             return next(model.buffers()).device
         except StopIteration:
-            preferred = get_preferred_device()
-            return preferred if preferred.type == "cuda" else torch.device("cpu")
+            return torch.device("cpu")
 
 
 def iter_text_batches(ds, batch_size: int):

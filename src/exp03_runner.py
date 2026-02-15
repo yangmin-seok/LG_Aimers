@@ -224,13 +224,14 @@ def make_text_dataset(tokenizer, split_expr: str) -> Dataset:
 
 
 def get_eval_device(model) -> torch.device:
-    preferred = get_preferred_device()
-    if preferred.type == "cuda":
-        return preferred
     try:
         return next(model.parameters()).device
     except StopIteration:
-        return torch.device("cpu")
+        try:
+            return next(model.buffers()).device
+        except StopIteration:
+            preferred = get_preferred_device()
+            return preferred if preferred.type == "cuda" else torch.device("cpu")
 
 
 def iter_text_batches(ds, batch_size: int):
@@ -245,7 +246,6 @@ def iter_text_batches(ds, batch_size: int):
 
 def mean_ce_loss(model, tokenizer, ds, max_len: int) -> float:
     model.eval()
-    place_model_for_eval(model)
     device = get_eval_device(model)
     total_nll = 0.0
     total_tokens = 0
@@ -284,7 +284,6 @@ def mean_ce_loss(model, tokenizer, ds, max_len: int) -> float:
 
 def mean_token_accuracy(model, tokenizer, ds, max_len: int) -> float:
     model.eval()
-    place_model_for_eval(model)
     device = get_eval_device(model)
     total_correct = 0
     total_count = 0
@@ -323,7 +322,6 @@ def mean_token_accuracy(model, tokenizer, ds, max_len: int) -> float:
 
 def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int = 64) -> float:
     model.eval()
-    place_model_for_eval(model)
     device = get_eval_device(model)
     total_time = 0.0
     total_new_tokens = 0
@@ -396,9 +394,15 @@ def get_model_device_map():
 
 
 def place_model_for_eval(model):
+    # Optional best-effort helper. Avoid forcing .to(...) on compressed models,
+    # because some quantized modules may not support parameter relocation.
     target = get_preferred_device()
-    if target.type == "cuda":
+    if target.type != "cuda":
+        return
+    try:
         model.to(target)
+    except Exception as exc:
+        print(f"[WARN] skip model.to({target}) during eval: {exc}")
 
 def load_model(dtype: torch.dtype, device_map=None):
     return AutoModelForCausalLM.from_pretrained(

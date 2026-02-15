@@ -54,6 +54,7 @@ BASE_SPEED_SEC_PER_TOKEN = None
 BASE_PERF = None
 EVAL_BATCH_SIZE = 8
 SPEED_BATCH_SIZE = 4
+PREFER_CUDA = True
 
 
 @dataclass(frozen=True)
@@ -223,10 +224,13 @@ def make_text_dataset(tokenizer, split_expr: str) -> Dataset:
 
 
 def get_eval_device(model) -> torch.device:
+    preferred = get_preferred_device()
+    if preferred.type == "cuda":
+        return preferred
     try:
         return next(model.parameters()).device
     except StopIteration:
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device("cpu")
 
 
 def iter_text_batches(ds, batch_size: int):
@@ -241,6 +245,7 @@ def iter_text_batches(ds, batch_size: int):
 
 def mean_ce_loss(model, tokenizer, ds, max_len: int) -> float:
     model.eval()
+    place_model_for_eval(model)
     device = get_eval_device(model)
     total_nll = 0.0
     total_tokens = 0
@@ -279,6 +284,7 @@ def mean_ce_loss(model, tokenizer, ds, max_len: int) -> float:
 
 def mean_token_accuracy(model, tokenizer, ds, max_len: int) -> float:
     model.eval()
+    place_model_for_eval(model)
     device = get_eval_device(model)
     total_correct = 0
     total_count = 0
@@ -317,6 +323,7 @@ def mean_token_accuracy(model, tokenizer, ds, max_len: int) -> float:
 
 def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int = 64) -> float:
     model.eval()
+    place_model_for_eval(model)
     device = get_eval_device(model)
     total_time = 0.0
     total_new_tokens = 0
@@ -375,6 +382,24 @@ def compute_score(perf_model: float, perf_base: float, spt_model: float, spt_bas
     return perf_norm, speed_norm, score
 
 
+
+
+def get_preferred_device() -> torch.device:
+    if PREFER_CUDA and torch.cuda.is_available():
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+def get_model_device_map():
+    device = get_preferred_device()
+    return "cuda:0" if device.type == "cuda" else "cpu"
+
+
+def place_model_for_eval(model):
+    target = get_preferred_device()
+    if target.type == "cuda":
+        model.to(target)
+
 def load_model(dtype: torch.dtype, device_map=None):
     return AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
@@ -395,7 +420,7 @@ def free_memory(*objs):
 def run_experiment(exp: Experiment, tokenizer, eval_ds, dtype):
     print(f"[RUN] {exp.name}")
     print(f"[RUN] loading model: {MODEL_ID}")
-    model = load_model(dtype=dtype, device_map="auto")
+    model = load_model(dtype=dtype, device_map=get_model_device_map())
     targets = build_targets(exp.layer_start, exp.layer_end, exp.submodules)
     print(f"[RUN] target modules: {len(targets)}")
     print(f"[RUN] preparing calibration dataset: n_calib={exp.n_calib}, max_seq_len={exp.max_seq_len}")
@@ -577,7 +602,7 @@ def main():
     else:
         # Baseline model: speed and diagnostic CE-loss.
         print("[BASE] loading baseline model")
-        base_model = load_model(dtype=dtype, device_map="auto")
+        base_model = load_model(dtype=dtype, device_map=get_model_device_map())
         print("[BASE] computing CE loss")
         base_ce = mean_ce_loss(base_model, tokenizer, eval_ds, max_len=512)
         print("[BASE] computing speed proxy")
@@ -683,7 +708,7 @@ def main():
                 exp03_model_dir.as_posix(),
                 trust_remote_code=True,
                 torch_dtype=dtype,
-                device_map="auto",
+                device_map=get_model_device_map(),
             )
             ce_loss = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
             spt = sec_per_token(model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
@@ -776,6 +801,7 @@ def main():
     final_model_dir.mkdir(parents=True, exist_ok=True)
     best_model.save_pretrained(final_model_dir, safe_serialization=True, save_compressed=True)
     tokenizer.save_pretrained(final_model_dir)
+    free_memory(best_model)
 
     # Submission format: submit.zip/model/*
     model_dir = Path("model")

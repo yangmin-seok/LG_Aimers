@@ -55,6 +55,7 @@
 - `BASE_MODEL_DIR`
 - `BASE_CE_LOSS`, `BASE_SPEED_SEC_PER_TOKEN`, `BASE_PERF` (베이스 측정값 재사용 시)
 - `EVAL_BATCH_SIZE`, `SPEED_BATCH_SIZE` (평가 속도 튜닝)
+- `PREFER_CUDA` (가능하면 모델/평가를 GPU로 고정)
 
 예시:
 
@@ -100,6 +101,7 @@ PERF_SOURCE = "token_acc"
 - `PERF_SOURCE="external"`인데 `PERF_CMD_TEMPLATE`가 비어 있으면 자동으로 `token_acc` proxy를 사용합니다.
 - 외부 평가기 없이 정확도 측정이 필요하면 `PERF_SOURCE="token_acc"`를 사용하세요(권장).
 - `ce_loss`는 진단용으로 출력되며 공식 점수 계산에는 직접 사용되지 않습니다.
-- loss/accuracy/speed 평가는 배치 단위로 GPU에서 실행됩니다(모델 device 기준).
+- `PREFER_CUDA=True`이고 CUDA가 있으면 GPTQ/평가 모두 `cuda:0` 우선으로 실행합니다.
+- loss/accuracy/speed 평가는 배치 단위로 실행되며, 가능한 경우 GPU에서 동작합니다.
 - 여러 후보 모델을 순차 실행할 때, 선택되지 않은 모델은 `free_memory(...)`로 즉시 GPU 메모리를 비웁니다.
 - CUDA GPU 환경(모델 다운로드/양자화 가능)이 필요합니다.

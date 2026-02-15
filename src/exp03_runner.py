@@ -33,14 +33,14 @@ ALL_SUBMODULES = [
 
 # Colab-friendly runtime configuration (edit values directly instead of CLI flags).
 OUT_DIR = "content/drive/MyDrive/model"
-FINAL_MODEL_DIR = "artifacts/final_model"
+FINAL_MODEL_DIR = "final_model"
 SUBMISSION_ZIP = "submit.zip"
 EVAL_SAMPLES = 96
 DTYPE = "bfloat16"  # "bfloat16" | "float16"
 SKIP_EXP03_ANCHOR = False
 EXP03_PUBLIC_SCORE = 0.605
-EXP03_MODEL_DIR = "artifacts/exp03_anchor_model"
-PERF_SOURCE = "external"  # "external" | "ce_proxy" | "token_acc"
+EXP03_MODEL_DIR = "exp03_anchor_model"
+PERF_SOURCE = "token_acc"  # "external" | "ce_proxy" | "token_acc"
 # External perf evaluator command template. Use {model_dir} placeholder.
 PERF_CMD_TEMPLATE = ""
 BASE_MODEL_DIR = ""
@@ -50,14 +50,14 @@ BASE_MODEL_DIR = ""
 # BASE_CE_LOSS = 1.768302
 # BASE_SPEED_SEC_PER_TOKEN = 0.044679
 # BASE_PERF = 0.565432
-BASE_CE_LOSS = None
-BASE_SPEED_SEC_PER_TOKEN = None
-BASE_PERF = None
+BASE_CE_LOSS = 1.769130
+BASE_SPEED_SEC_PER_TOKEN = 0.009040
+BASE_PERF = 0.640391
 EVAL_BATCH_SIZE = 8
 SPEED_BATCH_SIZE = 4
 PREFER_CUDA = True
 REQUIRE_CUDA = True
-PRE_QUANT_DIR = "artifacts/pre_quant_models"
+QUANTIZED_MODEL_SUBDIR = "quantized_models"
 
 
 @dataclass(frozen=True)
@@ -471,23 +471,14 @@ def signature_hash(signature: str) -> str:
     return hashlib.sha1(signature.encode("utf-8")).hexdigest()[:12]
 
 
-def get_pre_quantized_dir(root: Path, exp: Experiment) -> Path:
+def get_quantized_model_dir(root: Path, exp: Experiment) -> Path:
     return root / f"{exp.name}__{signature_hash(exp.signature())}"
 
 
-def run_experiment(exp: Experiment, tokenizer, eval_ds, dtype, pre_quant_root: Path):
+def run_experiment(exp: Experiment, tokenizer, eval_ds, dtype, quantized_root: Path):
     print(f"[RUN] {exp.name}")
     print(f"[RUN] loading model: {MODEL_ID}")
     model = load_model(dtype=dtype, device_map=get_model_device_map())
-
-    pre_quant_dir = get_pre_quantized_dir(pre_quant_root, exp)
-    if pre_quant_dir.exists():
-        print(f"[RUN] pre-quant model already saved: {pre_quant_dir}")
-    else:
-        ensure_clean_dir(pre_quant_dir)
-        model.save_pretrained(pre_quant_dir, safe_serialization=True)
-        tokenizer.save_pretrained(pre_quant_dir)
-        print(f"[RUN] saved pre-quant model: {pre_quant_dir}")
 
     targets = build_targets(exp.layer_start, exp.layer_end, exp.submodules)
     print(f"[RUN] target modules: {len(targets)}")
@@ -514,6 +505,12 @@ def run_experiment(exp: Experiment, tokenizer, eval_ds, dtype, pre_quant_root: P
         num_calibration_samples=exp.n_calib,
     )
     print("[RUN] quantization finished")
+    quantized_dir = get_quantized_model_dir(quantized_root, exp)
+    ensure_clean_dir(quantized_dir)
+    model.save_pretrained(quantized_dir, safe_serialization=True, save_compressed=True)
+    tokenizer.save_pretrained(quantized_dir)
+    print(f"[RUN] saved quantized model before eval: {quantized_dir}")
+
     print("[RUN] evaluating CE loss")
     ce_loss = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
     print("[RUN] evaluating speed proxy")
@@ -659,8 +656,8 @@ def main():
 
     perf_tmp_root = output_dir / "perf_models"
     perf_tmp_root.mkdir(parents=True, exist_ok=True)
-    pre_quant_root = Path(PRE_QUANT_DIR)
-    pre_quant_root.mkdir(parents=True, exist_ok=True)
+    quantized_root = output_dir / QUANTIZED_MODEL_SUBDIR
+    quantized_root.mkdir(parents=True, exist_ok=True)
 
     use_precomputed_base = all(v is not None for v in (BASE_CE_LOSS, BASE_SPEED_SEC_PER_TOKEN, BASE_PERF))
     if use_precomputed_base:
@@ -810,7 +807,7 @@ def main():
                 tokenizer=tokenizer,
                 eval_ds=eval_ds,
                 dtype=dtype,
-                pre_quant_root=pre_quant_root,
+                quantized_root=quantized_root,
             )
             exp_model_dir = perf_tmp_root / exp.name
             ensure_clean_dir(exp_model_dir)

@@ -1,4 +1,3 @@
-import argparse
 import csv
 import gc
 import json
@@ -30,6 +29,20 @@ ALL_SUBMODULES = [
     "mlp.up_proj",
     "mlp.down_proj",
 ]
+
+# Colab-friendly runtime configuration (edit values directly instead of CLI flags).
+OUT_DIR = "content/drive/MyDrive/model"
+FINAL_MODEL_DIR = "artifacts/final_model"
+SUBMISSION_ZIP = "submit.zip"
+EVAL_SAMPLES = 96
+DTYPE = "bfloat16"  # "bfloat16" | "float16"
+SKIP_EXP03_ANCHOR = False
+EXP03_PUBLIC_SCORE = 0.605
+EXP03_MODEL_DIR = "artifacts/exp03_anchor_model"
+PERF_SOURCE = "external"  # "external" | "ce_proxy"
+# External perf evaluator command template. Use {model_dir} placeholder.
+PERF_CMD_TEMPLATE = ""
+BASE_MODEL_DIR = ""
 
 
 @dataclass(frozen=True)
@@ -433,33 +446,19 @@ def apply_exp03_anchor(rows, exp03_public_score: float):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out-dir", default="content/drive/MyDrive/model", type=str)
-    parser.add_argument("--final-model-dir", default="artifacts/final_model", type=str)
-    parser.add_argument("--submission-zip", default="submit.zip", type=str)
-    parser.add_argument("--eval-samples", default=96, type=int)
-    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
-    parser.add_argument("--skip-exp03-anchor", action="store_true")
-    parser.add_argument("--exp03-public-score", default=0.605, type=float)
-    parser.add_argument("--exp03-model-dir", default="artifacts/exp03_anchor_model", type=str)
-    parser.add_argument("--perf-source", default="external", choices=["external", "ce_proxy"])
-    parser.add_argument(
-        "--perf-cmd-template",
-        default="",
-        type=str,
-        help="External perf evaluator command template. Use {model_dir} placeholder.",
-    )
-    parser.add_argument("--base-model-dir", default="", type=str)
-    args = parser.parse_args()
+    if DTYPE not in {"bfloat16", "float16"}:
+        raise ValueError(f"DTYPE must be 'bfloat16' or 'float16', got: {DTYPE}")
+    if PERF_SOURCE not in {"external", "ce_proxy"}:
+        raise ValueError(f"PERF_SOURCE must be 'external' or 'ce_proxy', got: {PERF_SOURCE}")
 
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    output_dir = Path(args.out_dir)
+    dtype = torch.bfloat16 if DTYPE == "bfloat16" else torch.float16
+    output_dir = Path(OUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("[INIT] loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    print(f"[INIT] preparing eval dataset: {args.eval_samples} samples")
-    eval_ds = make_text_dataset(tokenizer, f"train[20000:{20000 + args.eval_samples}]")
+    print(f"[INIT] preparing eval dataset: {EVAL_SAMPLES} samples")
+    eval_ds = make_text_dataset(tokenizer, f"train[20000:{20000 + EVAL_SAMPLES}]")
 
     # Baseline model: speed and diagnostic CE-loss.
     print("[BASE] loading baseline model")
@@ -471,8 +470,8 @@ def main():
 
     perf_tmp_root = output_dir / "perf_models"
     perf_tmp_root.mkdir(parents=True, exist_ok=True)
-    if args.base_model_dir:
-        base_model_dir = Path(args.base_model_dir)
+    if BASE_MODEL_DIR:
+        base_model_dir = Path(BASE_MODEL_DIR)
         if not base_model_dir.exists():
             raise FileNotFoundError(f"--base-model-dir does not exist: {base_model_dir}")
     else:
@@ -481,8 +480,8 @@ def main():
         base_model.save_pretrained(base_model_dir, safe_serialization=True)
         tokenizer.save_pretrained(base_model_dir)
     base_perf, base_perf_source = resolve_perf(
-        perf_source=args.perf_source,
-        perf_cmd_template=args.perf_cmd_template,
+        perf_source=PERF_SOURCE,
+        perf_cmd_template=PERF_CMD_TEMPLATE,
         model_dir=base_model_dir,
         ce_loss=base_ce,
     )
@@ -545,7 +544,7 @@ def main():
         ),
     ]
 
-    if args.skip_exp03_anchor:
+    if SKIP_EXP03_ANCHOR:
         candidates = [c for c in candidates if c.name != "exp03_anchor"]
 
     known_signatures = set(KNOWN_EXPERIMENTS.values())
@@ -560,7 +559,7 @@ def main():
         if exp.name != "exp03_anchor" and exp.signature() in known_signatures:
             print(f"[SKIP] duplicate signature: {exp.name}")
             continue
-        exp03_model_dir = Path(args.exp03_model_dir)
+        exp03_model_dir = Path(EXP03_MODEL_DIR)
         if exp.name == "exp03_anchor" and exp03_model_dir.exists():
             print(f"[RUN] {exp.name} (load prebuilt model: {exp03_model_dir})")
             model = AutoModelForCausalLM.from_pretrained(
@@ -572,8 +571,8 @@ def main():
             ce_loss = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
             spt = sec_per_token(model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
             perf, perf_source = resolve_perf(
-                perf_source=args.perf_source,
-                perf_cmd_template=args.perf_cmd_template,
+                perf_source=PERF_SOURCE,
+                perf_cmd_template=PERF_CMD_TEMPLATE,
                 model_dir=exp03_model_dir,
                 ce_loss=ce_loss,
             )
@@ -602,8 +601,8 @@ def main():
             model.save_pretrained(exp_model_dir, safe_serialization=True, save_compressed=True)
             tokenizer.save_pretrained(exp_model_dir)
             perf, perf_source = resolve_perf(
-                perf_source=args.perf_source,
-                perf_cmd_template=args.perf_cmd_template,
+                perf_source=PERF_SOURCE,
+                perf_cmd_template=PERF_CMD_TEMPLATE,
                 model_dir=exp_model_dir,
                 ce_loss=row["ce_loss"],
             )
@@ -629,7 +628,7 @@ def main():
             encoding="utf-8",
         )
 
-    calibration = apply_exp03_anchor(rows, args.exp03_public_score)
+    calibration = apply_exp03_anchor(rows, EXP03_PUBLIC_SCORE)
     if calibration is not None:
         print(f"[CALIBRATION] {calibration}")
         for row in rows:
@@ -643,7 +642,7 @@ def main():
     if best_model is None:
         raise RuntimeError("No new experiment left after duplicate filtering.")
 
-    final_model_dir = Path(args.final_model_dir)
+    final_model_dir = Path(FINAL_MODEL_DIR)
     if final_model_dir.exists():
         shutil.rmtree(final_model_dir)
     final_model_dir.mkdir(parents=True, exist_ok=True)
@@ -655,9 +654,9 @@ def main():
     if model_dir.exists():
         shutil.rmtree(model_dir)
     shutil.copytree(final_model_dir, model_dir)
-    zip_no_ext = Path(args.submission_zip).with_suffix("")
-    if Path(args.submission_zip).exists():
-        Path(args.submission_zip).unlink()
+    zip_no_ext = Path(SUBMISSION_ZIP).with_suffix("")
+    if Path(SUBMISSION_ZIP).exists():
+        Path(SUBMISSION_ZIP).unlink()
     shutil.make_archive(zip_no_ext.as_posix(), "zip", root_dir=".", base_dir="model")
 
     summary = {

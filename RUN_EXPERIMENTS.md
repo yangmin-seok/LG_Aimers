@@ -1,54 +1,105 @@
-# Experiment Runner (No Colab-specific steps)
+# Experiment Runner (`src/exp03_runner.py`)
 
-This repository now includes `src/exp03_runner.py` to:
+`src/exp03_runner.py`는 EXAONE 모델에 GPTQ를 적용하고, 후보 실험들을 비교해 최종 제출 산출물(`submit.zip`)을 생성합니다.
 
-1. Rebuild a GPTQ-compressed EXAONE model from `LGAI-EXAONE/EXAONE-4.0-1.2B`
-2. Measure score terms with competition formula:
+## What it does
+
+1. `LGAI-EXAONE/EXAONE-4.0-1.2B` 기반 GPTQ 양자화 실험 실행
+2. 대회 점수식 형태로 지표 계산
    - `PerfNorm = Perf_model / Perf_base_model`
    - `SpeedNorm = 1 - (sec_per_tok_model / sec_per_tok_base)`
    - `Score = max(0.5*PerfNorm + 0.5*SpeedNorm, 0)`
-3. Keep CE loss as diagnostic output only (not used in score)
-4. Always rerun `Exp_03` once as `exp03_anchor` (unless explicitly skipped)
-   - If `--exp03-model-dir` exists, it loads that model and skips re-quantization.
-5. Calibrate predicted score to known `Exp_03=0.605`:
+3. `exp03_anchor` 기준 보정 점수 계산
    - `ScorePred_AnchoredToExp03 = 0.605 + (Score - Score_exp03_anchor)`
-6. Avoid re-running known duplicate experiments (except the `exp03_anchor` run)
-7. Save only the best model once, then create `submit.zip` in required format
+4. 중복 시그니처 실험 스킵(단, `exp03_anchor`는 예외)
+5. 최고 점수 모델 저장 후 `submit.zip` 생성
 
-## Run
+---
 
-```bash
-python -m src.exp03_runner \
-  --out-dir artifacts/exp03_runner \
-  --final-model-dir artifacts/final_model \
-  --submission-zip submit.zip \
-  --perf-source external \
-  --perf-cmd-template "python eval_perf.py --model_dir {model_dir}"
+## Colab quick start
+
+아래 버전으로 먼저 설치하세요.
+
+```python
+!pip install -U torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1
 ```
 
-Optional:
+필요 패키지 설치(프로젝트 기준):
 
-```bash
-python -m src.exp03_runner --skip-exp03-anchor
+```python
+!pip install -r requirements.txt
 ```
 
-Use local prebuilt Exp_03 model:
+이후 `src/exp03_runner.py` 상단의 **대문자 상수**를 수정한 뒤 실행하면 됩니다.
 
-```bash
-python -m src.exp03_runner --exp03-model-dir ./model_QPTQ_layer5_24
+```python
+!python -m src.exp03_runner
 ```
+
+---
+
+## Configuration (edit constants in file)
+
+`argparse` 대신, 파일 상단 상수로 설정합니다.
+
+- `OUT_DIR`
+- `FINAL_MODEL_DIR`
+- `SUBMISSION_ZIP`
+- `EVAL_SAMPLES`
+- `DTYPE` (`"bfloat16"` or `"float16"`)
+- `SKIP_EXP03_ANCHOR`
+- `EXP03_PUBLIC_SCORE`
+- `EXP03_MODEL_DIR`
+- `PERF_SOURCE` (`"external"`, `"ce_proxy"`, or `"token_acc"`)
+- `PERF_CMD_TEMPLATE` (예: `python eval_perf.py --model_dir {model_dir}`)
+- `BASE_MODEL_DIR`
+- `BASE_CE_LOSS`, `BASE_SPEED_SEC_PER_TOKEN`, `BASE_PERF` (베이스 측정값 재사용 시)
+- `EVAL_BATCH_SIZE`, `SPEED_BATCH_SIZE` (평가 속도 튜닝)
+
+예시:
+
+```python
+OUT_DIR = "content/drive/MyDrive/model"
+DTYPE = "bfloat16"
+PERF_SOURCE = "external"
+PERF_CMD_TEMPLATE = "python eval_perf.py --model_dir {model_dir}"
+```
+
+베이스 모델은 한 번만 측정하고 재사용할 수 있습니다:
+
+```python
+BASE_CE_LOSS = 1.768302
+BASE_SPEED_SEC_PER_TOKEN = 0.044679
+BASE_PERF = 0.565432
+```
+
+위 3개를 모두 채우면 베이스 모델 로드/평가를 건너뜁니다.
+
+외부 평가 스크립트 없이 정확도까지 같이 보려면 아래처럼 토큰 정확도를 Perf로 쓸 수 있습니다:
+
+```python
+PERF_SOURCE = "token_acc"
+```
+
+`token_acc`는 현재 `EVAL_SAMPLES` 구간에서 next-token accuracy를 계산해 Perf로 사용합니다.
+
+---
 
 ## Outputs
 
-- `artifacts/exp03_runner/results.csv` (includes `Perf`, `PerfNorm`, `SpeedNorm`, `Score`, `ce_loss`)
-- `artifacts/exp03_runner/results.json`
-- `artifacts/exp03_runner/summary.json`
-- `artifacts/final_model/*`
-- `submit.zip` (contains top-level `model/` folder only)
+- `${OUT_DIR}/results.csv`
+- `${OUT_DIR}/results.json`
+- `${OUT_DIR}/summary.json`
+- `${FINAL_MODEL_DIR}/*`
+- `${SUBMISSION_ZIP}` (top-level `model/` 폴더를 포함한 zip)
+
+---
 
 ## Notes
 
-- No Colab-only code is used (`!pip`, `google.colab`, `files.download` are not used).
-- This runner is designed for CUDA GPU environments compatible with EXAONE + GPTQ.
-- If `--perf-source external` is used with the same evaluator pipeline, score definition matches the competition formula.
-- `ce_loss` is printed for diagnostics and is intentionally excluded from score calculation.
+- `PERF_SOURCE="external"`인데 `PERF_CMD_TEMPLATE`가 비어 있으면 자동으로 `token_acc` proxy를 사용합니다.
+- 외부 평가기 없이 정확도 측정이 필요하면 `PERF_SOURCE="token_acc"`를 사용하세요(권장).
+- `ce_loss`는 진단용으로 출력되며 공식 점수 계산에는 직접 사용되지 않습니다.
+- loss/accuracy/speed 평가는 배치 단위로 GPU에서 실행됩니다(모델 device 기준).
+- 여러 후보 모델을 순차 실행할 때, 선택되지 않은 모델은 `free_memory(...)`로 즉시 GPU 메모리를 비웁니다.
+- CUDA GPU 환경(모델 다운로드/양자화 가능)이 필요합니다.

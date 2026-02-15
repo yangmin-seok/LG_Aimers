@@ -50,9 +50,10 @@
 - `SKIP_EXP03_ANCHOR`
 - `EXP03_PUBLIC_SCORE`
 - `EXP03_MODEL_DIR`
-- `PERF_SOURCE` (`"external"` or `"ce_proxy"`)
+- `PERF_SOURCE` (`"external"`, `"ce_proxy"`, or `"token_acc"`)
 - `PERF_CMD_TEMPLATE` (예: `python eval_perf.py --model_dir {model_dir}`)
 - `BASE_MODEL_DIR`
+- `BASE_CE_LOSS`, `BASE_SPEED_SEC_PER_TOKEN`, `BASE_PERF` (베이스 측정값 재사용 시)
 
 예시:
 
@@ -62,6 +63,24 @@ DTYPE = "bfloat16"
 PERF_SOURCE = "external"
 PERF_CMD_TEMPLATE = "python eval_perf.py --model_dir {model_dir}"
 ```
+
+베이스 모델은 한 번만 측정하고 재사용할 수 있습니다:
+
+```python
+BASE_CE_LOSS = 1.768302
+BASE_SPEED_SEC_PER_TOKEN = 0.044679
+BASE_PERF = 0.565432
+```
+
+위 3개를 모두 채우면 베이스 모델 로드/평가를 건너뜁니다.
+
+외부 평가 스크립트 없이 정확도까지 같이 보려면 아래처럼 토큰 정확도를 Perf로 쓸 수 있습니다:
+
+```python
+PERF_SOURCE = "token_acc"
+```
+
+`token_acc`는 현재 `EVAL_SAMPLES` 구간에서 next-token accuracy를 계산해 Perf로 사용합니다.
 
 ---
 
@@ -77,6 +96,7 @@ PERF_CMD_TEMPLATE = "python eval_perf.py --model_dir {model_dir}"
 
 ## Notes
 
-- `PERF_SOURCE="external"`인 경우 `PERF_CMD_TEMPLATE`를 반드시 설정해야 합니다.
+- `PERF_SOURCE="external"`인데 `PERF_CMD_TEMPLATE`가 비어 있으면 자동으로 `ce_proxy`로 fallback 됩니다.
+- 외부 평가기 없이 정확도 측정이 필요하면 `PERF_SOURCE="token_acc"`를 사용하세요.
 - `ce_loss`는 진단용으로 출력되며 공식 점수 계산에는 직접 사용되지 않습니다.
 - CUDA GPU 환경(모델 다운로드/양자화 가능)이 필요합니다.

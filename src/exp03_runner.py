@@ -39,7 +39,7 @@ EVAL_SAMPLES = 96
 DTYPE = "bfloat16"  # "bfloat16" | "float16"
 SKIP_EXP03_ANCHOR = False
 EXP03_PUBLIC_SCORE = 0.605
-EXP03_MODEL_DIR = "exp03_anchor_model"
+EXP03_MODEL_DIR = ""  # optional override; default uses OUT_DIR/QUANTIZED_MODEL_SUBDIR/exp03_anchor__<sig>
 PERF_SOURCE = "token_acc"  # "external" | "ce_proxy" | "token_acc"
 # External perf evaluator command template. Use {model_dir} placeholder.
 PERF_CMD_TEMPLATE = ""
@@ -768,7 +768,11 @@ def main():
         if exp.name != "exp03_anchor" and exp.signature() in known_signatures:
             print(f"[SKIP] duplicate signature: {exp.name}")
             continue
-        exp03_model_dir = Path(EXP03_MODEL_DIR)
+        exp03_model_dir = (
+            Path(EXP03_MODEL_DIR)
+            if EXP03_MODEL_DIR
+            else get_quantized_model_dir(quantized_root, exp)
+        )
         if exp.name == "exp03_anchor" and exp03_model_dir.exists():
             print(f"[RUN] {exp.name} (load prebuilt model: {exp03_model_dir})")
             model = AutoModelForCausalLM.from_pretrained(

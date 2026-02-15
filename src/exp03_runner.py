@@ -1,4 +1,3 @@
-import argparse
 import csv
 import gc
 import json
@@ -30,6 +29,32 @@ ALL_SUBMODULES = [
     "mlp.up_proj",
     "mlp.down_proj",
 ]
+
+# Colab-friendly runtime configuration (edit values directly instead of CLI flags).
+OUT_DIR = "content/drive/MyDrive/model"
+FINAL_MODEL_DIR = "artifacts/final_model"
+SUBMISSION_ZIP = "submit.zip"
+EVAL_SAMPLES = 96
+DTYPE = "bfloat16"  # "bfloat16" | "float16"
+SKIP_EXP03_ANCHOR = False
+EXP03_PUBLIC_SCORE = 0.605
+EXP03_MODEL_DIR = "artifacts/exp03_anchor_model"
+PERF_SOURCE = "external"  # "external" | "ce_proxy" | "token_acc"
+# External perf evaluator command template. Use {model_dir} placeholder.
+PERF_CMD_TEMPLATE = ""
+BASE_MODEL_DIR = ""
+# Optional precomputed baseline values to skip base model evaluation.
+# Set all three values as floats to reuse a previously measured baseline.
+# Example:
+# BASE_CE_LOSS = 1.768302
+# BASE_SPEED_SEC_PER_TOKEN = 0.044679
+# BASE_PERF = 0.565432
+BASE_CE_LOSS = None
+BASE_SPEED_SEC_PER_TOKEN = None
+BASE_PERF = None
+EVAL_BATCH_SIZE = 8
+SPEED_BATCH_SIZE = 4
+PREFER_CUDA = True
 
 
 @dataclass(frozen=True)
@@ -196,55 +221,131 @@ def make_text_dataset(tokenizer, split_expr: str) -> Dataset:
     return text_ds
 
 
+
+
+def get_eval_device(model) -> torch.device:
+    preferred = get_preferred_device()
+    if preferred.type == "cuda":
+        return preferred
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        try:
+            return next(model.buffers()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+
+def iter_text_batches(ds, batch_size: int):
+    batch = []
+    for row in ds:
+        batch.append(row["text"])
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
 def mean_ce_loss(model, tokenizer, ds, max_len: int) -> float:
     model.eval()
+    device = get_eval_device(model)
     total_nll = 0.0
     total_tokens = 0
     total_rows = len(ds) if hasattr(ds, "__len__") else None
     progress_step = max(total_rows // 10, 1) if total_rows else None
+    processed = 0
     if total_rows:
-        print(f"[EVAL-CE] start: {total_rows} samples")
+        print(f"[EVAL-CE] start: {total_rows} samples (batch_size={EVAL_BATCH_SIZE}, device={device})")
     with torch.no_grad():
-        for i, row in enumerate(ds, start=1):
+        for texts in iter_text_batches(ds, EVAL_BATCH_SIZE):
             enc = tokenizer(
-                row["text"],
+                texts,
                 return_tensors="pt",
                 truncation=True,
                 max_length=max_len,
+                padding=True,
             )
-            enc = {k: v.to(model.device) for k, v in enc.items()}
+            enc = {k: v.to(device) for k, v in enc.items()}
             if enc["input_ids"].shape[1] < 2:
+                processed += len(texts)
                 continue
-            out = model(**enc, labels=enc["input_ids"])
-            n_tokens = int(enc["input_ids"].shape[1])
+            labels = enc["input_ids"].clone()
+            labels[enc["attention_mask"] == 0] = -100
+            out = model(**enc, labels=labels)
+            n_tokens = int((enc["attention_mask"] == 1).sum().item())
             total_nll += float(out.loss.item()) * n_tokens
             total_tokens += n_tokens
-            if total_rows and (i % progress_step == 0 or i == total_rows):
-                pct = (i / total_rows) * 100.0
-                print(f"[EVAL-CE] progress: {i}/{total_rows} ({pct:.0f}%)")
+            processed += len(texts)
+            if total_rows and (processed % progress_step == 0 or processed >= total_rows):
+                pct = (processed / total_rows) * 100.0
+                print(f"[EVAL-CE] progress: {processed}/{total_rows} ({pct:.0f}%)")
     ce = total_nll / max(total_tokens, 1)
     print(f"[EVAL-CE] done: tokens={total_tokens}, loss={ce:.6f}")
     return ce
 
 
+def mean_token_accuracy(model, tokenizer, ds, max_len: int) -> float:
+    model.eval()
+    device = get_eval_device(model)
+    total_correct = 0
+    total_count = 0
+    total_rows = len(ds) if hasattr(ds, "__len__") else None
+    progress_step = max(total_rows // 10, 1) if total_rows else None
+    processed = 0
+    if total_rows:
+        print(f"[EVAL-ACC] start: {total_rows} samples (batch_size={EVAL_BATCH_SIZE}, device={device})")
+    with torch.no_grad():
+        for texts in iter_text_batches(ds, EVAL_BATCH_SIZE):
+            enc = tokenizer(
+                texts,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_len,
+                padding=True,
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+            if enc["input_ids"].shape[1] < 2:
+                processed += len(texts)
+                continue
+            logits = model(**enc).logits
+            pred_ids = logits[:, :-1, :].argmax(dim=-1)
+            tgt_ids = enc["input_ids"][:, 1:]
+            valid = enc["attention_mask"][:, 1:] == 1
+            total_correct += int(((pred_ids == tgt_ids) & valid).sum().item())
+            total_count += int(valid.sum().item())
+            processed += len(texts)
+            if total_rows and (processed % progress_step == 0 or processed >= total_rows):
+                pct = (processed / total_rows) * 100.0
+                print(f"[EVAL-ACC] progress: {processed}/{total_rows} ({pct:.0f}%)")
+    acc = total_correct / max(total_count, 1)
+    print(f"[EVAL-ACC] done: tokens={total_count}, accuracy={acc:.6f}")
+    return acc
+
+
 def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int = 64) -> float:
     model.eval()
+    device = get_eval_device(model)
     total_time = 0.0
     total_new_tokens = 0
     total_rows = len(ds) if hasattr(ds, "__len__") else None
     progress_step = max(total_rows // 10, 1) if total_rows else None
+    processed = 0
     if total_rows:
-        print(f"[EVAL-SPD] start: {total_rows} samples, max_new_tokens={max_new_tokens}")
+        print(
+            f"[EVAL-SPD] start: {total_rows} samples, max_new_tokens={max_new_tokens}, "
+            f"batch_size={SPEED_BATCH_SIZE}, device={device}"
+        )
     with torch.no_grad():
-        for i, row in enumerate(ds, start=1):
+        for texts in iter_text_batches(ds, SPEED_BATCH_SIZE):
             enc = tokenizer(
-                row["text"],
+                texts,
                 return_tensors="pt",
                 truncation=True,
                 max_length=prompt_max_len,
+                padding=True,
             )
-            enc = {k: v.to(model.device) for k, v in enc.items()}
-            prompt_len = int(enc["input_ids"].shape[1])
+            enc = {k: v.to(device) for k, v in enc.items()}
+            prompt_lens = enc["attention_mask"].sum(dim=1)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -257,13 +358,15 @@ def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t0
-            new_tokens = int(out.shape[1] - prompt_len)
+            out_len = int(out.shape[1])
+            new_tokens = (out_len - prompt_lens).clamp(min=0).sum().item()
             if new_tokens > 0:
                 total_time += elapsed
-                total_new_tokens += new_tokens
-            if total_rows and (i % progress_step == 0 or i == total_rows):
-                pct = (i / total_rows) * 100.0
-                print(f"[EVAL-SPD] progress: {i}/{total_rows} ({pct:.0f}%)")
+                total_new_tokens += int(new_tokens)
+            processed += len(texts)
+            if total_rows and (processed % progress_step == 0 or processed >= total_rows):
+                pct = (processed / total_rows) * 100.0
+                print(f"[EVAL-SPD] progress: {processed}/{total_rows} ({pct:.0f}%)")
     spt = total_time / max(total_new_tokens, 1)
     print(f"[EVAL-SPD] done: new_tokens={total_new_tokens}, sec/token={spt:.6f}")
     return spt
@@ -278,6 +381,30 @@ def compute_score(perf_model: float, perf_base: float, spt_model: float, spt_bas
     score = max(0.5 * perf_norm + 0.5 * speed_norm, 0.0)
     return perf_norm, speed_norm, score
 
+
+
+
+def get_preferred_device() -> torch.device:
+    if PREFER_CUDA and torch.cuda.is_available():
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+def get_model_device_map():
+    device = get_preferred_device()
+    return "cuda:0" if device.type == "cuda" else "cpu"
+
+
+def place_model_for_eval(model):
+    # Optional best-effort helper. Avoid forcing .to(...) on compressed models,
+    # because some quantized modules may not support parameter relocation.
+    target = get_preferred_device()
+    if target.type != "cuda":
+        return
+    try:
+        model.to(target)
+    except Exception as exc:
+        print(f"[WARN] skip model.to({target}) during eval: {exc}")
 
 def load_model(dtype: torch.dtype, device_map=None):
     return AutoModelForCausalLM.from_pretrained(
@@ -299,7 +426,7 @@ def free_memory(*objs):
 def run_experiment(exp: Experiment, tokenizer, eval_ds, dtype):
     print(f"[RUN] {exp.name}")
     print(f"[RUN] loading model: {MODEL_ID}")
-    model = load_model(dtype=dtype, device_map="auto")
+    model = load_model(dtype=dtype, device_map=get_model_device_map())
     targets = build_targets(exp.layer_start, exp.layer_end, exp.submodules)
     print(f"[RUN] target modules: {len(targets)}")
     print(f"[RUN] preparing calibration dataset: n_calib={exp.n_calib}, max_seq_len={exp.max_seq_len}")
@@ -387,12 +514,27 @@ def resolve_perf(
 ) -> tuple[float, str]:
     if perf_source == "external":
         if not perf_cmd_template:
-            raise ValueError("--perf-cmd-template is required when --perf-source=external")
+            print(
+                "[PERF] PERF_SOURCE='external' but PERF_CMD_TEMPLATE is empty; "
+                "falling back to ce_proxy."
+            )
+            return 1.0 / max(ce_loss, 1e-12), "ce_proxy"
         perf = evaluate_perf_external(perf_cmd_template=perf_cmd_template, model_dir=model_dir)
         return perf, "external"
     # Fallback debug mode only.
     return 1.0 / max(ce_loss, 1e-12), "ce_proxy"
 
+
+
+
+def resolve_effective_perf_source(perf_source: str, perf_cmd_template: str) -> str:
+    if perf_source == "external" and not perf_cmd_template:
+        print(
+            "[PERF] PERF_SOURCE='external' but PERF_CMD_TEMPLATE is empty; "
+            "using token_acc proxy (closer to accuracy than ce_proxy)."
+        )
+        return "token_acc"
+    return perf_source
 
 def print_score_breakdown(row):
     msg = (
@@ -433,60 +575,65 @@ def apply_exp03_anchor(rows, exp03_public_score: float):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out-dir", default="content/drive/MyDrive/model", type=str)
-    parser.add_argument("--final-model-dir", default="artifacts/final_model", type=str)
-    parser.add_argument("--submission-zip", default="submit.zip", type=str)
-    parser.add_argument("--eval-samples", default=96, type=int)
-    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
-    parser.add_argument("--skip-exp03-anchor", action="store_true")
-    parser.add_argument("--exp03-public-score", default=0.605, type=float)
-    parser.add_argument("--exp03-model-dir", default="artifacts/exp03_anchor_model", type=str)
-    parser.add_argument("--perf-source", default="external", choices=["external", "ce_proxy"])
-    parser.add_argument(
-        "--perf-cmd-template",
-        default="",
-        type=str,
-        help="External perf evaluator command template. Use {model_dir} placeholder.",
-    )
-    parser.add_argument("--base-model-dir", default="", type=str)
-    args = parser.parse_args()
+    if DTYPE not in {"bfloat16", "float16"}:
+        raise ValueError(f"DTYPE must be 'bfloat16' or 'float16', got: {DTYPE}")
+    if PERF_SOURCE not in {"external", "ce_proxy", "token_acc"}:
+        raise ValueError(
+            f"PERF_SOURCE must be 'external', 'ce_proxy', or 'token_acc', got: {PERF_SOURCE}"
+        )
 
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    output_dir = Path(args.out_dir)
+    dtype = torch.bfloat16 if DTYPE == "bfloat16" else torch.float16
+    output_dir = Path(OUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("[INIT] loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    print(f"[INIT] preparing eval dataset: {args.eval_samples} samples")
-    eval_ds = make_text_dataset(tokenizer, f"train[20000:{20000 + args.eval_samples}]")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    print(f"[INIT] preparing eval dataset: {EVAL_SAMPLES} samples")
+    eval_ds = make_text_dataset(tokenizer, f"train[20000:{20000 + EVAL_SAMPLES}]")
 
-    # Baseline model: speed and diagnostic CE-loss.
-    print("[BASE] loading baseline model")
-    base_model = load_model(dtype=dtype, device_map="auto")
-    print("[BASE] computing CE loss")
-    base_ce = mean_ce_loss(base_model, tokenizer, eval_ds, max_len=512)
-    print("[BASE] computing speed proxy")
-    base_spt = sec_per_token(base_model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
+    effective_perf_source = resolve_effective_perf_source(PERF_SOURCE, PERF_CMD_TEMPLATE)
 
     perf_tmp_root = output_dir / "perf_models"
     perf_tmp_root.mkdir(parents=True, exist_ok=True)
-    if args.base_model_dir:
-        base_model_dir = Path(args.base_model_dir)
-        if not base_model_dir.exists():
-            raise FileNotFoundError(f"--base-model-dir does not exist: {base_model_dir}")
+
+    use_precomputed_base = all(v is not None for v in (BASE_CE_LOSS, BASE_SPEED_SEC_PER_TOKEN, BASE_PERF))
+    if use_precomputed_base:
+        base_ce = float(BASE_CE_LOSS)
+        base_spt = float(BASE_SPEED_SEC_PER_TOKEN)
+        base_perf = float(BASE_PERF)
+        base_perf_source = "precomputed_constant"
+        print("[BASE] using precomputed constants (BASE_CE_LOSS/BASE_SPEED_SEC_PER_TOKEN/BASE_PERF)")
     else:
-        base_model_dir = perf_tmp_root / "base_model"
-        ensure_clean_dir(base_model_dir)
-        base_model.save_pretrained(base_model_dir, safe_serialization=True)
-        tokenizer.save_pretrained(base_model_dir)
-    base_perf, base_perf_source = resolve_perf(
-        perf_source=args.perf_source,
-        perf_cmd_template=args.perf_cmd_template,
-        model_dir=base_model_dir,
-        ce_loss=base_ce,
-    )
-    free_memory(base_model)
+        # Baseline model: speed and diagnostic CE-loss.
+        print("[BASE] loading baseline model")
+        base_model = load_model(dtype=dtype, device_map=get_model_device_map())
+        print("[BASE] computing CE loss")
+        base_ce = mean_ce_loss(base_model, tokenizer, eval_ds, max_len=512)
+        print("[BASE] computing speed proxy")
+        base_spt = sec_per_token(base_model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
+
+        if effective_perf_source == "token_acc":
+            base_perf = mean_token_accuracy(base_model, tokenizer, eval_ds, max_len=512)
+            base_perf_source = "token_acc"
+        else:
+            if BASE_MODEL_DIR:
+                base_model_dir = Path(BASE_MODEL_DIR)
+                if not base_model_dir.exists():
+                    raise FileNotFoundError(f"BASE_MODEL_DIR does not exist: {base_model_dir}")
+            else:
+                base_model_dir = perf_tmp_root / "base_model"
+                ensure_clean_dir(base_model_dir)
+                base_model.save_pretrained(base_model_dir, safe_serialization=True)
+                tokenizer.save_pretrained(base_model_dir)
+            base_perf, base_perf_source = resolve_perf(
+                perf_source=effective_perf_source,
+                perf_cmd_template=PERF_CMD_TEMPLATE,
+                model_dir=base_model_dir,
+                ce_loss=base_ce,
+            )
+        free_memory(base_model)
 
     print(
         f"[BASE] Perf={base_perf:.6f} (source={base_perf_source}) | "
@@ -545,7 +692,7 @@ def main():
         ),
     ]
 
-    if args.skip_exp03_anchor:
+    if SKIP_EXP03_ANCHOR:
         candidates = [c for c in candidates if c.name != "exp03_anchor"]
 
     known_signatures = set(KNOWN_EXPERIMENTS.values())
@@ -560,23 +707,26 @@ def main():
         if exp.name != "exp03_anchor" and exp.signature() in known_signatures:
             print(f"[SKIP] duplicate signature: {exp.name}")
             continue
-        exp03_model_dir = Path(args.exp03_model_dir)
+        exp03_model_dir = Path(EXP03_MODEL_DIR)
         if exp.name == "exp03_anchor" and exp03_model_dir.exists():
             print(f"[RUN] {exp.name} (load prebuilt model: {exp03_model_dir})")
             model = AutoModelForCausalLM.from_pretrained(
                 exp03_model_dir.as_posix(),
                 trust_remote_code=True,
                 torch_dtype=dtype,
-                device_map="auto",
+                device_map=get_model_device_map(),
             )
             ce_loss = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
             spt = sec_per_token(model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
-            perf, perf_source = resolve_perf(
-                perf_source=args.perf_source,
-                perf_cmd_template=args.perf_cmd_template,
-                model_dir=exp03_model_dir,
-                ce_loss=ce_loss,
-            )
+            if effective_perf_source == "token_acc":
+                perf, perf_source = mean_token_accuracy(model, tokenizer, eval_ds, max_len=512), "token_acc"
+            else:
+                perf, perf_source = resolve_perf(
+                    perf_source=effective_perf_source,
+                    perf_cmd_template=PERF_CMD_TEMPLATE,
+                    model_dir=exp03_model_dir,
+                    ce_loss=ce_loss,
+                )
             perf_norm, speed_norm, score = compute_score(perf, base_perf, spt, base_spt)
             row = {
                 "name": exp.name,
@@ -601,13 +751,21 @@ def main():
             ensure_clean_dir(exp_model_dir)
             model.save_pretrained(exp_model_dir, safe_serialization=True, save_compressed=True)
             tokenizer.save_pretrained(exp_model_dir)
-            perf, perf_source = resolve_perf(
-                perf_source=args.perf_source,
-                perf_cmd_template=args.perf_cmd_template,
-                model_dir=exp_model_dir,
-                ce_loss=row["ce_loss"],
+            if effective_perf_source == "token_acc":
+                perf, perf_source = mean_token_accuracy(model, tokenizer, eval_ds, max_len=512), "token_acc"
+            else:
+                perf, perf_source = resolve_perf(
+                    perf_source=effective_perf_source,
+                    perf_cmd_template=PERF_CMD_TEMPLATE,
+                    model_dir=exp_model_dir,
+                    ce_loss=row["ce_loss"],
+                )
+            perf_norm, speed_norm, score = compute_score(
+                perf,
+                base_perf,
+                row["speed_proxy_sec_per_token"],
+                base_spt,
             )
-            perf_norm, speed_norm, score = compute_score(perf, base_perf, row["speed_proxy_sec_per_token"], base_spt)
             row["perf_source"] = perf_source
             row["Perf"] = perf
             row["PerfNorm"] = perf_norm
@@ -629,7 +787,7 @@ def main():
             encoding="utf-8",
         )
 
-    calibration = apply_exp03_anchor(rows, args.exp03_public_score)
+    calibration = apply_exp03_anchor(rows, EXP03_PUBLIC_SCORE)
     if calibration is not None:
         print(f"[CALIBRATION] {calibration}")
         for row in rows:
@@ -643,28 +801,29 @@ def main():
     if best_model is None:
         raise RuntimeError("No new experiment left after duplicate filtering.")
 
-    final_model_dir = Path(args.final_model_dir)
+    final_model_dir = Path(FINAL_MODEL_DIR)
     if final_model_dir.exists():
         shutil.rmtree(final_model_dir)
     final_model_dir.mkdir(parents=True, exist_ok=True)
     best_model.save_pretrained(final_model_dir, safe_serialization=True, save_compressed=True)
     tokenizer.save_pretrained(final_model_dir)
+    free_memory(best_model)
 
     # Submission format: submit.zip/model/*
     model_dir = Path("model")
     if model_dir.exists():
         shutil.rmtree(model_dir)
     shutil.copytree(final_model_dir, model_dir)
-    zip_no_ext = Path(args.submission_zip).with_suffix("")
-    if Path(args.submission_zip).exists():
-        Path(args.submission_zip).unlink()
+    zip_no_ext = Path(SUBMISSION_ZIP).with_suffix("")
+    if Path(SUBMISSION_ZIP).exists():
+        Path(SUBMISSION_ZIP).unlink()
     shutil.make_archive(zip_no_ext.as_posix(), "zip", root_dir=".", base_dir="model")
 
     summary = {
         "best": best_row,
         "historical_baseline": {"name": "Exp_03", "public_score": 0.605, "elapsed": "9m36s"},
         "historical_results": HISTORICAL_RESULTS,
-        "perf_metric_note": "Score uses official formula shape with Perf from external evaluator if provided.",
+        "perf_metric_note": "Score uses official formula shape. Without external evaluator, token_acc proxy is used.",
         "base": {"Perf": base_perf, "perf_source": base_perf_source, "ce_loss": base_ce, "speed_sec_per_token": base_spt},
         "calibration": calibration,
         "saved_model_dir": str(final_model_dir),

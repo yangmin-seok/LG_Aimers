@@ -52,6 +52,8 @@ BASE_MODEL_DIR = ""
 BASE_CE_LOSS = None
 BASE_SPEED_SEC_PER_TOKEN = None
 BASE_PERF = None
+EVAL_BATCH_SIZE = 8
+SPEED_BATCH_SIZE = 4
 
 
 @dataclass(frozen=True)
@@ -218,32 +220,58 @@ def make_text_dataset(tokenizer, split_expr: str) -> Dataset:
     return text_ds
 
 
+
+
+def get_eval_device(model) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def iter_text_batches(ds, batch_size: int):
+    batch = []
+    for row in ds:
+        batch.append(row["text"])
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
 def mean_ce_loss(model, tokenizer, ds, max_len: int) -> float:
     model.eval()
+    device = get_eval_device(model)
     total_nll = 0.0
     total_tokens = 0
     total_rows = len(ds) if hasattr(ds, "__len__") else None
     progress_step = max(total_rows // 10, 1) if total_rows else None
+    processed = 0
     if total_rows:
-        print(f"[EVAL-CE] start: {total_rows} samples")
+        print(f"[EVAL-CE] start: {total_rows} samples (batch_size={EVAL_BATCH_SIZE}, device={device})")
     with torch.no_grad():
-        for i, row in enumerate(ds, start=1):
+        for texts in iter_text_batches(ds, EVAL_BATCH_SIZE):
             enc = tokenizer(
-                row["text"],
+                texts,
                 return_tensors="pt",
                 truncation=True,
                 max_length=max_len,
+                padding=True,
             )
-            enc = {k: v.to(model.device) for k, v in enc.items()}
+            enc = {k: v.to(device) for k, v in enc.items()}
             if enc["input_ids"].shape[1] < 2:
+                processed += len(texts)
                 continue
-            out = model(**enc, labels=enc["input_ids"])
-            n_tokens = int(enc["input_ids"].shape[1])
+            labels = enc["input_ids"].clone()
+            labels[enc["attention_mask"] == 0] = -100
+            out = model(**enc, labels=labels)
+            n_tokens = int((enc["attention_mask"] == 1).sum().item())
             total_nll += float(out.loss.item()) * n_tokens
             total_tokens += n_tokens
-            if total_rows and (i % progress_step == 0 or i == total_rows):
-                pct = (i / total_rows) * 100.0
-                print(f"[EVAL-CE] progress: {i}/{total_rows} ({pct:.0f}%)")
+            processed += len(texts)
+            if total_rows and (processed % progress_step == 0 or processed >= total_rows):
+                pct = (processed / total_rows) * 100.0
+                print(f"[EVAL-CE] progress: {processed}/{total_rows} ({pct:.0f}%)")
     ce = total_nll / max(total_tokens, 1)
     print(f"[EVAL-CE] done: tokens={total_tokens}, loss={ce:.6f}")
     return ce
@@ -251,31 +279,37 @@ def mean_ce_loss(model, tokenizer, ds, max_len: int) -> float:
 
 def mean_token_accuracy(model, tokenizer, ds, max_len: int) -> float:
     model.eval()
+    device = get_eval_device(model)
     total_correct = 0
     total_count = 0
     total_rows = len(ds) if hasattr(ds, "__len__") else None
     progress_step = max(total_rows // 10, 1) if total_rows else None
+    processed = 0
     if total_rows:
-        print(f"[EVAL-ACC] start: {total_rows} samples")
+        print(f"[EVAL-ACC] start: {total_rows} samples (batch_size={EVAL_BATCH_SIZE}, device={device})")
     with torch.no_grad():
-        for i, row in enumerate(ds, start=1):
+        for texts in iter_text_batches(ds, EVAL_BATCH_SIZE):
             enc = tokenizer(
-                row["text"],
+                texts,
                 return_tensors="pt",
                 truncation=True,
                 max_length=max_len,
+                padding=True,
             )
-            enc = {k: v.to(model.device) for k, v in enc.items()}
+            enc = {k: v.to(device) for k, v in enc.items()}
             if enc["input_ids"].shape[1] < 2:
+                processed += len(texts)
                 continue
             logits = model(**enc).logits
             pred_ids = logits[:, :-1, :].argmax(dim=-1)
             tgt_ids = enc["input_ids"][:, 1:]
-            total_correct += int((pred_ids == tgt_ids).sum().item())
-            total_count += int(tgt_ids.numel())
-            if total_rows and (i % progress_step == 0 or i == total_rows):
-                pct = (i / total_rows) * 100.0
-                print(f"[EVAL-ACC] progress: {i}/{total_rows} ({pct:.0f}%)")
+            valid = enc["attention_mask"][:, 1:] == 1
+            total_correct += int(((pred_ids == tgt_ids) & valid).sum().item())
+            total_count += int(valid.sum().item())
+            processed += len(texts)
+            if total_rows and (processed % progress_step == 0 or processed >= total_rows):
+                pct = (processed / total_rows) * 100.0
+                print(f"[EVAL-ACC] progress: {processed}/{total_rows} ({pct:.0f}%)")
     acc = total_correct / max(total_count, 1)
     print(f"[EVAL-ACC] done: tokens={total_count}, accuracy={acc:.6f}")
     return acc
@@ -283,22 +317,28 @@ def mean_token_accuracy(model, tokenizer, ds, max_len: int) -> float:
 
 def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int = 64) -> float:
     model.eval()
+    device = get_eval_device(model)
     total_time = 0.0
     total_new_tokens = 0
     total_rows = len(ds) if hasattr(ds, "__len__") else None
     progress_step = max(total_rows // 10, 1) if total_rows else None
+    processed = 0
     if total_rows:
-        print(f"[EVAL-SPD] start: {total_rows} samples, max_new_tokens={max_new_tokens}")
+        print(
+            f"[EVAL-SPD] start: {total_rows} samples, max_new_tokens={max_new_tokens}, "
+            f"batch_size={SPEED_BATCH_SIZE}, device={device}"
+        )
     with torch.no_grad():
-        for i, row in enumerate(ds, start=1):
+        for texts in iter_text_batches(ds, SPEED_BATCH_SIZE):
             enc = tokenizer(
-                row["text"],
+                texts,
                 return_tensors="pt",
                 truncation=True,
                 max_length=prompt_max_len,
+                padding=True,
             )
-            enc = {k: v.to(model.device) for k, v in enc.items()}
-            prompt_len = int(enc["input_ids"].shape[1])
+            enc = {k: v.to(device) for k, v in enc.items()}
+            prompt_lens = enc["attention_mask"].sum(dim=1)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -311,13 +351,15 @@ def sec_per_token(model, tokenizer, ds, prompt_max_len: int, max_new_tokens: int
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t0
-            new_tokens = int(out.shape[1] - prompt_len)
+            out_len = int(out.shape[1])
+            new_tokens = (out_len - prompt_lens).clamp(min=0).sum().item()
             if new_tokens > 0:
                 total_time += elapsed
-                total_new_tokens += new_tokens
-            if total_rows and (i % progress_step == 0 or i == total_rows):
-                pct = (i / total_rows) * 100.0
-                print(f"[EVAL-SPD] progress: {i}/{total_rows} ({pct:.0f}%)")
+                total_new_tokens += int(new_tokens)
+            processed += len(texts)
+            if total_rows and (processed % progress_step == 0 or processed >= total_rows):
+                pct = (processed / total_rows) * 100.0
+                print(f"[EVAL-SPD] progress: {processed}/{total_rows} ({pct:.0f}%)")
     spt = total_time / max(total_new_tokens, 1)
     print(f"[EVAL-SPD] done: new_tokens={total_new_tokens}, sec/token={spt:.6f}")
     return spt
@@ -452,6 +494,17 @@ def resolve_perf(
     return 1.0 / max(ce_loss, 1e-12), "ce_proxy"
 
 
+
+
+def resolve_effective_perf_source(perf_source: str, perf_cmd_template: str) -> str:
+    if perf_source == "external" and not perf_cmd_template:
+        print(
+            "[PERF] PERF_SOURCE='external' but PERF_CMD_TEMPLATE is empty; "
+            "using token_acc proxy (closer to accuracy than ce_proxy)."
+        )
+        return "token_acc"
+    return perf_source
+
 def print_score_breakdown(row):
     msg = (
         f"[SCORE] {row['name']} | "
@@ -504,8 +557,12 @@ def main():
 
     print("[INIT] loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     print(f"[INIT] preparing eval dataset: {EVAL_SAMPLES} samples")
     eval_ds = make_text_dataset(tokenizer, f"train[20000:{20000 + EVAL_SAMPLES}]")
+
+    effective_perf_source = resolve_effective_perf_source(PERF_SOURCE, PERF_CMD_TEMPLATE)
 
     perf_tmp_root = output_dir / "perf_models"
     perf_tmp_root.mkdir(parents=True, exist_ok=True)
@@ -526,7 +583,7 @@ def main():
         print("[BASE] computing speed proxy")
         base_spt = sec_per_token(base_model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
 
-        if PERF_SOURCE == "token_acc":
+        if effective_perf_source == "token_acc":
             base_perf = mean_token_accuracy(base_model, tokenizer, eval_ds, max_len=512)
             base_perf_source = "token_acc"
         else:
@@ -540,7 +597,7 @@ def main():
                 base_model.save_pretrained(base_model_dir, safe_serialization=True)
                 tokenizer.save_pretrained(base_model_dir)
             base_perf, base_perf_source = resolve_perf(
-                perf_source=PERF_SOURCE,
+                perf_source=effective_perf_source,
                 perf_cmd_template=PERF_CMD_TEMPLATE,
                 model_dir=base_model_dir,
                 ce_loss=base_ce,
@@ -630,11 +687,11 @@ def main():
             )
             ce_loss = mean_ce_loss(model, tokenizer, eval_ds, max_len=512)
             spt = sec_per_token(model, tokenizer, eval_ds, prompt_max_len=512, max_new_tokens=64)
-            if PERF_SOURCE == "token_acc":
+            if effective_perf_source == "token_acc":
                 perf, perf_source = mean_token_accuracy(model, tokenizer, eval_ds, max_len=512), "token_acc"
             else:
                 perf, perf_source = resolve_perf(
-                    perf_source=PERF_SOURCE,
+                    perf_source=effective_perf_source,
                     perf_cmd_template=PERF_CMD_TEMPLATE,
                     model_dir=exp03_model_dir,
                     ce_loss=ce_loss,
@@ -663,11 +720,11 @@ def main():
             ensure_clean_dir(exp_model_dir)
             model.save_pretrained(exp_model_dir, safe_serialization=True, save_compressed=True)
             tokenizer.save_pretrained(exp_model_dir)
-            if PERF_SOURCE == "token_acc":
+            if effective_perf_source == "token_acc":
                 perf, perf_source = mean_token_accuracy(model, tokenizer, eval_ds, max_len=512), "token_acc"
             else:
                 perf, perf_source = resolve_perf(
-                    perf_source=PERF_SOURCE,
+                    perf_source=effective_perf_source,
                     perf_cmd_template=PERF_CMD_TEMPLATE,
                     model_dir=exp_model_dir,
                     ce_loss=row["ce_loss"],
@@ -734,7 +791,7 @@ def main():
         "best": best_row,
         "historical_baseline": {"name": "Exp_03", "public_score": 0.605, "elapsed": "9m36s"},
         "historical_results": HISTORICAL_RESULTS,
-        "perf_metric_note": "Score uses official formula shape with Perf from external/token_acc/ce_proxy source.",
+        "perf_metric_note": "Score uses official formula shape. Without external evaluator, token_acc proxy is used.",
         "base": {"Perf": base_perf, "perf_source": base_perf_source, "ce_loss": base_ce, "speed_sec_per_token": base_spt},
         "calibration": calibration,
         "saved_model_dir": str(final_model_dir),
